@@ -57,6 +57,7 @@
 #include <seastar/core/thread.hh>
 #include <chrono>
 #include "dht/i_partitioner.hh"
+#include <boost/range/algorithm/set_algorithm.hpp>
 
 namespace gms {
 
@@ -534,7 +535,7 @@ void gossiper::run() {
             // We don't care about heart_beat change on other CPUs - so ingnore this
             // specific change.
             //
-            shadow_endpoint_state_map[br_addr].set_heart_beat_state(hbs);
+            shadow_endpoint_state_map[br_addr].get_heart_beat_state() = hbs;
 
             logger.trace("My heartbeat is now {}", endpoint_state_map[br_addr].get_heart_beat_state().get_heart_beat_version());
             std::vector<gossip_digest> g_digests;
@@ -596,6 +597,8 @@ void gossiper::run() {
             if (endpoint_map_changed || live_endpoint_changed || unreachable_endpoint_changed) {
                 if (endpoint_map_changed) {
                     shadow_endpoint_state_map = endpoint_state_map;
+                    _features_condvar.broadcast();
+                    maybe_enable_features();
                 }
 
                 if (live_endpoint_changed) {
@@ -612,6 +615,8 @@ void gossiper::run() {
                     if (engine().cpu_id() != 0) {
                         if (endpoint_map_changed) {
                             local_gossiper.endpoint_state_map = shadow_endpoint_state_map;
+                            local_gossiper._features_condvar.broadcast();
+                            local_gossiper.maybe_enable_features();
                         }
 
                         if (live_endpoint_changed) {
@@ -1109,21 +1114,13 @@ void gossiper::mark_alive(inet_address addr, endpoint_state& local_state) {
     local_state.mark_dead();
     msg_addr id = get_msg_addr(addr);
     logger.trace("Sending a EchoMessage to {}", id);
-    auto ok = make_shared<bool>(false);
-    ms().send_gossip_echo(id).then_wrapped([this, id, ok] (auto&& f) mutable {
-        try {
-            f.get();
-            logger.trace("Got EchoMessage Reply");
-            *ok = true;
-        } catch (...) {
-            logger.warn("Fail to send EchoMessage to {}: {}", id, std::current_exception());
-        }
-        return make_ready_future<>();
-    }).get();
-
-    if (*ok) {
-        this->set_last_processed_message_at();
-        this->real_mark_alive(id.addr, local_state);
+    try {
+        ms().send_gossip_echo(id).get();
+        logger.trace("Got EchoMessage Reply");
+        set_last_processed_message_at();
+        real_mark_alive(id.addr, local_state);
+    } catch(...) {
+        logger.warn("Fail to send EchoMessage to {}: {}", id, std::current_exception());
     }
 }
 
@@ -1133,7 +1130,10 @@ void gossiper::real_mark_alive(inet_address addr, endpoint_state& local_state) {
     local_state.mark_alive();
     local_state.update_timestamp(); // prevents do_status_check from racing us and evicting if it was down > A_VERY_LONG_TIME
     _live_endpoints.insert(addr);
-    _live_endpoints_just_added.push_back(addr);
+    auto it = std::find(_live_endpoints_just_added.begin(), _live_endpoints_just_added.end(), addr);
+    if (it == _live_endpoints_just_added.end()) {
+        _live_endpoints_just_added.push_back(addr);
+    }
     _unreachable_endpoints.erase(addr);
     _expire_time_endpoint_map.erase(addr);
     logger.debug("removing expire time for endpoint : {}", addr);
@@ -1230,7 +1230,7 @@ void gossiper::apply_new_states(inet_address addr, endpoint_state& local_state, 
     // don't assert here, since if the node restarts the version will go back to zero
     //int oldVersion = local_state.get_heart_beat_state().get_heart_beat_version();
 
-    local_state.set_heart_beat_state(remote_state.get_heart_beat_state());
+    local_state.set_heart_beat_state_and_update_timestamp(remote_state.get_heart_beat_state());
     // if (logger.isTraceEnabled()) {
     //     logger.trace("Updating heartbeat state version to {} from {} for {} ...",
     //     local_state.get_heart_beat_state().get_heart_beat_version(), oldVersion, addr);
@@ -1447,7 +1447,7 @@ void gossiper::add_saved_endpoint(inet_address ep) {
     if (it != endpoint_state_map.end()) {
         ep_state = it->second;
         logger.debug("not replacing a previous ep_state for {}, but reusing it: {}", ep, ep_state);
-        ep_state.set_heart_beat_state(heart_beat_state(0));
+        ep_state.set_heart_beat_state_and_update_timestamp(heart_beat_state(0));
     }
     ep_state.mark_dead();
     endpoint_state_map[ep] = ep_state;
@@ -1529,6 +1529,7 @@ future<> gossiper::do_stop_gossiping() {
                 get_local_failure_detector().unregister_failure_detection_event_listener(&g);
             }
             g.uninit_messaging_service_handler();
+            g._features_condvar.broken();
             return make_ready_future<>();
         }).get();
     });
@@ -1590,12 +1591,12 @@ bool gossiper::is_alive(inet_address ep) {
     if (ep == get_broadcast_address()) {
         return true;
     }
-    auto eps = get_endpoint_state_for_endpoint(ep);
+    auto it = endpoint_state_map.find(ep);
     // we could assert not-null, but having isAlive fail screws a node over so badly that
     // it's worth being defensive here so minor bugs don't cause disproportionate
     // badness.  (See CASSANDRA-1463 for an example).
-    if (eps) {
-        return eps->is_alive();
+    if (it != endpoint_state_map.end()) {
+        return it->second.is_alive();
     } else {
         logger.warn("unknown endpoint {}", ep);
         return false;
@@ -1749,32 +1750,69 @@ std::set<sstring> gossiper::get_supported_features() const {
     return common_features;
 }
 
-static future<stop_iteration> check_features(auto features, auto need_features, auto expire) {
+static bool check_features(std::set<sstring> features, std::set<sstring> need_features) {
     logger.info("Checking if need_features {} in features {}", need_features, features);
-    if (std::includes(features.begin(), features.end(), need_features.begin(), need_features.end())) {
-        return make_ready_future<stop_iteration>(stop_iteration::yes);
-    }
-    if (gossiper::now() > expire) {
-        throw std::runtime_error(sprint("Unable to wait for feature %s", need_features));
+    return boost::range::includes(features, need_features);
+}
+
+future<> gossiper::wait_for_feature_on_all_node(std::set<sstring> features) {
+    return _features_condvar.wait([this, features = std::move(features)] {
+        return check_features(get_supported_features(), features);
+    });
+}
+
+future<> gossiper::wait_for_feature_on_node(std::set<sstring> features, inet_address endpoint) {
+    return _features_condvar.wait([this, features = std::move(features), endpoint = std::move(endpoint)] {
+        return check_features(get_supported_features(endpoint), features);
+    });
+}
+
+void gossiper::register_feature(feature* f) {
+    if (check_features(get_local_gossiper().get_supported_features(), {f->name()})) {
+        f->_enabled = true;
     } else {
-        return sleep(std::chrono::seconds(2)).then([] {
-            return make_ready_future<stop_iteration>(stop_iteration::no);
-        });
+        _registered_features.emplace(f->name(), std::vector<feature*>()).first->second.emplace_back(f);
     }
 }
 
-future<> gossiper::wait_for_feature_on_all_node(std::set<sstring> features, std::chrono::seconds timeout) const {
-    auto expire = now() + timeout;
-    return repeat([this, features, expire] {
-        return check_features(get_supported_features(), features, expire);
-    });
+void gossiper::unregister_feature(feature* f) {
+    auto&& fs = _registered_features[f->name()];
+    auto it = std::find(fs.begin(), fs.end(), f);
+    if (it != fs.end()) {
+        fs.erase(it);
+    }
 }
 
-future<> gossiper::wait_for_feature_on_node(std::set<sstring> features, inet_address endpoint, std::chrono::seconds timeout) const {
-    auto expire = now() + timeout;
-    return repeat([this, features, endpoint, expire] {
-        return check_features(get_supported_features(endpoint), features, expire);
-    });
+void gossiper::maybe_enable_features() {
+    if (_registered_features.empty()) {
+        return;
+    }
+
+    auto&& features = get_supported_features();
+    for (auto it = _registered_features.begin(); it != _registered_features.end(); ) {
+        if (features.find(it->first) != features.end()) {
+            for (auto&& f : it->second) {
+                f->_enabled = true;
+            }
+            it = _registered_features.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+feature::feature(sstring name, bool enabled)
+        : _name(name)
+        , _enabled(enabled) {
+    if (!_enabled) {
+        get_local_gossiper().register_feature(this);
+    }
+}
+
+feature::~feature() {
+    if (!_enabled) {
+        get_local_gossiper().unregister_feature(this);
+    }
 }
 
 } // namespace gms

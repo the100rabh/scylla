@@ -76,6 +76,7 @@ namespace service {
 
 static logging::logger logger("storage_proxy");
 static logging::logger qlogger("query_result");
+static logging::logger mlogger("mutation_data");
 
 distributed<service::storage_proxy> _the_storage_proxy;
 
@@ -431,33 +432,38 @@ storage_proxy::storage_proxy(distributed<database>& db) : _db(db) {
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
+                , "total_operations", "global_read_repairs_canceled_due_to_concurrent_write")
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.global_read_repairs_canceled_due_to_concurrent_write)
+        ),
+        scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
+                , scollectd::per_cpu_plugin_instance
                 , "total_operations", "write timeouts")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.write_timeouts)
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.write_timeouts._count)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
                 , "total_operations", "write unavailable")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.write_unavailables)
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.write_unavailables._count)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
                 , "total_operations", "read timeouts")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.read_timeouts)
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.read_timeouts._count)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
                 , "total_operations", "read unavailable")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.read_unavailables)
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.read_unavailables._count)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
                 , "total_operations", "range slice timeouts")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.range_slice_timeouts)
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.range_slice_timeouts._count)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
                 , "total_operations", "range slice unavailable")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.range_slice_unavailables)
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.range_slice_unavailables._count)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
@@ -1012,7 +1018,7 @@ future<> storage_proxy::mutate_end(future<> mutate_result, utils::latency_counte
     assert(mutate_result.available());
     _stats.write.mark(lc.stop().latency_in_nano());
     if (lc.is_start()) {
-        _stats.estimated_write.add(lc.latency(), _stats.write.count);
+        _stats.estimated_write.add(lc.latency(), _stats.write.hist.count);
     }
     try {
         mutate_result.get();
@@ -1023,14 +1029,14 @@ future<> storage_proxy::mutate_end(future<> mutate_result, utils::latency_counte
     } catch(mutation_write_timeout_exception& ex) {
         // timeout
         logger.debug("Write timeout; received {} of {} required replies", ex.received, ex.block_for);
-        _stats.write_timeouts++;
+        _stats.write_timeouts.mark();
         return make_exception_future<>(std::current_exception());
     } catch (exceptions::unavailable_exception& ex) {
-        _stats.write_unavailables++;
+        _stats.write_unavailables.mark();
         logger.trace("Unavailable");
         return make_exception_future<>(std::current_exception());
     }  catch(overloaded_exception& ex) {
-        _stats.write_unavailables++;
+        _stats.write_unavailables.mark();
         logger.trace("Overloaded");
         return make_exception_future<>(std::current_exception());
     }
@@ -1047,6 +1053,8 @@ future<> storage_proxy::mutate_end(future<> mutate_result, utils::latency_counte
  */
 future<>
 storage_proxy::mutate(std::vector<mutation> mutations, db::consistency_level cl) {
+    logger.trace("mutate cl={}", cl, mutations);
+    mlogger.trace("mutations={}", mutations);
     auto type = mutations.size() == 1 ? db::write_type::SIMPLE : db::write_type::UNLOGGED_BATCH;
     utils::latency_counter lc;
     lc.start();
@@ -1536,6 +1544,7 @@ class digest_read_resolver : public abstract_read_resolver {
     bool _cl_reported = false;
     foreign_ptr<lw_shared_ptr<query::result>> _data_result;
     std::vector<query::result_digest> _digest_results;
+    api::timestamp_type _last_modified = api::missing_timestamp;
 
     virtual void on_timeout() override {
         if (!_cl_reported) {
@@ -1554,15 +1563,17 @@ public:
         if (!_timedout) {
             // if only one target was queried digest_check() will be skipped so we can also skip digest calculation
             _digest_results.emplace_back(_targets_count == 1 ? query::result_digest() : *result->digest());
+            _last_modified = std::max(_last_modified, result->last_modified());
             if (!_data_result) {
                 _data_result = std::move(result);
             }
             got_response(from);
         }
     }
-    void add_digest(gms::inet_address from, query::result_digest digest) {
+    void add_digest(gms::inet_address from, query::result_digest digest, api::timestamp_type last_modified) {
         if (!_timedout) {
             _digest_results.emplace_back(std::move(digest));
+            _last_modified = std::max(_last_modified, last_modified);
             got_response(from);
         }
     }
@@ -1603,6 +1614,9 @@ public:
     }
     bool is_completed() {
         return response_count() == _targets_count;
+    }
+    api::timestamp_type last_modified() const {
+        return _last_modified;
     }
 };
 
@@ -1906,13 +1920,15 @@ protected:
             });
         }
     }
-    future<query::result_digest> make_digest_request(gms::inet_address ep, clock_type::time_point timeout) {
+    future<query::result_digest, api::timestamp_type> make_digest_request(gms::inet_address ep, clock_type::time_point timeout) {
         ++_proxy->_stats.digest_read_attempts.get_ep_stat(ep);
         if (is_me(ep)) {
             return _proxy->query_singular_local_digest(_schema, _cmd, _partition_range);
         } else {
             auto& ms = net::get_local_messaging_service();
-            return ms.send_read_digest(net::messaging_service::msg_addr{ep, 0}, timeout, *_cmd, _partition_range);
+            return ms.send_read_digest(net::messaging_service::msg_addr{ep, 0}, timeout, *_cmd, _partition_range).then([] (query::result_digest d, rpc::optional<api::timestamp_type> t) {
+                return make_ready_future<query::result_digest, api::timestamp_type>(d, t ? t.value() : api::missing_timestamp);
+            });
         }
     }
     future<> make_mutation_data_requests(lw_shared_ptr<query::read_command> cmd, data_resolver_ptr resolver, targets_iterator begin, targets_iterator end, clock_type::time_point timeout) {
@@ -1943,9 +1959,10 @@ protected:
     }
     future<> make_digest_requests(digest_resolver_ptr resolver, targets_iterator begin, targets_iterator end, clock_type::time_point timeout) {
         return parallel_for_each(begin, end, [this, resolver = std::move(resolver), timeout] (gms::inet_address ep) {
-            return make_digest_request(ep, timeout).then_wrapped([this, resolver, ep] (future<query::result_digest> f) {
+            return make_digest_request(ep, timeout).then_wrapped([this, resolver, ep] (future<query::result_digest, api::timestamp_type> f) {
                 try {
-                    resolver->add_digest(ep, f.get0());
+                    auto v = f.get();
+                    resolver->add_digest(ep, std::get<0>(v), std::get<1>(v));
                     ++_proxy->_stats.digest_read_completed.get_ep_stat(ep);
                 } catch(...) {
                     ++_proxy->_stats.digest_read_errors.get_ep_stat(ep);
@@ -2036,7 +2053,18 @@ public:
                     if (exec->_block_for < exec->_targets.size()) { // if there are more targets then needed for cl, check digest in background
                         background_repair_check = true;
                     }
-                } else { // digest missmatch
+                } else { // digest mismatch
+                    if (is_datacenter_local(exec->_cl)) {
+                        auto write_timeout = exec->_proxy->_db.local().get_config().write_request_timeout_in_ms() * 1000;
+                        auto delta = __int128_t(digest_resolver->last_modified()) - __int128_t(exec->_cmd->read_timestamp);
+                        if (std::abs(delta) <= write_timeout) {
+                            print("HERE %d\n", int64_t(delta));
+                            exec->_proxy->_stats.global_read_repairs_canceled_due_to_concurrent_write++;
+                            // if CL is local and non matching data is modified less then write_timeout ms ago do only local repair
+                            auto i = boost::range::remove_if(exec->_targets, std::not1(std::cref(db::is_local)));
+                            exec->_targets.erase(i, exec->_targets.end());
+                        }
+                    }
                     exec->reconcile(exec->_cl, timeout);
                     exec->_proxy->_stats.read_repair_repaired_blocking++;
                 }
@@ -2202,10 +2230,10 @@ db::read_repair_decision storage_proxy::new_read_repair_decision(const schema& s
     }
 }
 
-future<query::result_digest>
+future<query::result_digest, api::timestamp_type>
 storage_proxy::query_singular_local_digest(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr) {
     return query_singular_local(std::move(s), std::move(cmd), pr, query::result_request::only_digest).then([] (foreign_ptr<lw_shared_ptr<query::result>> result) {
-        return *result->digest();
+        return make_ready_future<query::result_digest, api::timestamp_type>(*result->digest(), result->last_modified());
     });
 }
 
@@ -2224,7 +2252,7 @@ void storage_proxy::handle_read_error(std::exception_ptr eptr) {
         std::rethrow_exception(eptr);
     } catch (read_timeout_exception& ex) {
         logger.debug("Read timeout: received {} of {} required replies, data {}present", ex.received, ex.block_for, ex.data_present ? "" : "not ");
-        _stats.read_timeouts++;
+        _stats.read_timeouts.mark();
     } catch (...) {
         logger.debug("Error during read query {}", eptr);
     }
@@ -2428,7 +2456,7 @@ storage_proxy::do_query(schema_ptr s,
             return query_singular(cmd, std::move(partition_ranges), cl).finally([lc, p] () mutable {
                     p->_stats.read.mark(lc.stop().latency_in_nano());
                     if (lc.is_start()) {
-                        p->_stats.estimated_read.add(lc.latency(), p->_stats.read.count);
+                        p->_stats.estimated_read.add(lc.latency(), p->_stats.read.hist.count);
                     }
             });
         } catch (const no_such_column_family&) {
@@ -2946,8 +2974,8 @@ void storage_proxy::init_messaging_service() {
                     return ms.send_mutation_done(net::messaging_service::msg_addr{reply_to, shard}, shard, response_id).then_wrapped([] (future<> f) {
                         f.ignore_ready_future();
                     });
-                }).handle_exception([] (std::exception_ptr eptr) {
-                    logger.warn("MUTATION verb handler: {}", eptr);
+                }).handle_exception([reply_to, shard] (std::exception_ptr eptr) {
+                    logger.warn("Failed to apply mutation from {}#{}: {}", reply_to, shard, eptr);
                 }),
                 parallel_for_each(forward.begin(), forward.end(), [reply_to, shard, response_id, &m, &p] (gms::inet_address forward) {
                     auto& ms = net::get_local_messaging_service();
@@ -3156,7 +3184,8 @@ private:
         return _db.invoke_on(_shard, [this] (database& db) {
             schema_ptr s = _schema;
             column_family& cf = db.find_column_family(s->id());
-            return make_foreign(std::make_unique<remote_state>(remote_state{cf.make_reader(std::move(s), _range, *_pc)}));
+            return make_foreign(std::make_unique<remote_state>(
+                remote_state{cf.make_reader(std::move(s), _range, query::no_clustering_key_filtering, *_pc)}));
         }).then([this] (auto&& ptr) {
             _remote = std::move(ptr);
         });

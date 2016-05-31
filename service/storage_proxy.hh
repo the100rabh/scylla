@@ -111,12 +111,12 @@ public:
     };
 
     struct stats {
-        uint64_t read_timeouts = 0;
-        uint64_t read_unavailables = 0;
-        uint64_t range_slice_timeouts = 0;
-        uint64_t range_slice_unavailables = 0;
-        uint64_t write_timeouts = 0;
-        uint64_t write_unavailables = 0;
+        utils::timed_rate_moving_average read_timeouts;
+        utils::timed_rate_moving_average read_unavailables;
+        utils::timed_rate_moving_average range_slice_timeouts;
+        utils::timed_rate_moving_average range_slice_unavailables;
+        utils::timed_rate_moving_average write_timeouts;
+        utils::timed_rate_moving_average write_unavailables;
 
         // total write attempts
         split_stats writes_attempts;
@@ -128,6 +128,7 @@ public:
         uint64_t read_repair_attempts = 0;
         uint64_t read_repair_repaired_blocking = 0;
         uint64_t read_repair_repaired_background = 0;
+        uint64_t global_read_repairs_canceled_due_to_concurrent_write = 0;
 
         // number of mutations received as a coordinator
         uint64_t received_mutations = 0;
@@ -136,9 +137,9 @@ public:
         uint64_t forwarded_mutations = 0;
         uint64_t forwarding_errors = 0;
 
-        utils::ihistogram read;
-        utils::ihistogram write;
-        utils::ihistogram range;
+        utils::timed_rate_moving_average_and_histogram read;
+        utils::timed_rate_moving_average_and_histogram write;
+        utils::timed_rate_moving_average_and_histogram range;
         sstables::estimated_histogram estimated_read;
         sstables::estimated_histogram estimated_write;
         sstables::estimated_histogram estimated_range;
@@ -212,7 +213,7 @@ private:
     ::shared_ptr<abstract_read_executor> get_read_executor(lw_shared_ptr<query::read_command> cmd, query::partition_range pr, db::consistency_level cl);
     future<foreign_ptr<lw_shared_ptr<query::result>>> query_singular_local(schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr,
                                                                            query::result_request request = query::result_request::result_and_digest);
-    future<query::result_digest> query_singular_local_digest(schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr);
+    future<query::result_digest, api::timestamp_type> query_singular_local_digest(schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr);
     future<foreign_ptr<lw_shared_ptr<query::result>>> query_partition_key_range(lw_shared_ptr<query::read_command> cmd, query::partition_range&& range, db::consistency_level cl);
     std::vector<query::partition_range> get_restricted_ranges(keyspace& ks, const schema& s, query::partition_range range);
     float estimate_result_rows_per_range(lw_shared_ptr<query::read_command> cmd, keyspace& ks);

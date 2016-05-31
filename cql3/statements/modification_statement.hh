@@ -42,7 +42,7 @@
 #pragma once
 
 #include "cql3/restrictions/restriction.hh"
-#include "cql3/statements/cf_statement.hh"
+#include "cql3/statements/raw/cf_statement.hh"
 #include "cql3/column_identifier.hh"
 #include "cql3/update_parameters.hh"
 #include "cql3/column_condition.hh"
@@ -69,7 +69,7 @@ namespace statements {
 /*
  * Abstract parent class of individual modifications, i.e. INSERT, UPDATE and DELETE.
  */
-class modification_statement : public cql_statement {
+class modification_statement : public cql_statement_no_metadata {
 private:
     static thread_local const ::shared_ptr<column_identifier> CAS_RESULT_COLUMN;
 
@@ -347,7 +347,7 @@ protected:
     virtual void validate_where_clause_for_conditions();
 
 public:
-    class parsed : public cf_statement {
+    class parsed : public raw::cf_statement {
     public:
         using conditions_vector = std::vector<std::pair<::shared_ptr<column_identifier::raw>, ::shared_ptr<column_condition::raw>>>;
     protected:
@@ -360,7 +360,7 @@ public:
         parsed(::shared_ptr<cf_name> name, ::shared_ptr<attributes::raw> attrs, conditions_vector conditions, bool if_not_exists, bool if_exists);
 
     public:
-        virtual ::shared_ptr<parsed_statement::prepared> prepare(database& db) override;
+        virtual ::shared_ptr<prepared> prepare(database& db) override;
         ::shared_ptr<modification_statement> prepare(database& db, ::shared_ptr<variable_specifications> bound_names);;
     protected:
         virtual ::shared_ptr<modification_statement> prepare_internal(database& db, schema_ptr schema,

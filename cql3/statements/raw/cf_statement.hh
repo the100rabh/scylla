@@ -41,14 +41,19 @@
 
 #pragma once
 
-#include "cql3/statements/parsed_statement.hh"
 #include "cql3/cf_name.hh"
 
 #include <experimental/optional>
 
+#include "parsed_statement.hh"
+
+namespace service { class client_state; }
+
 namespace cql3 {
 
 namespace statements {
+
+namespace raw {
 
 /**
  * Abstract class for statements that apply on a given column family.
@@ -68,6 +73,8 @@ public:
 
     virtual const sstring& column_family() const;
 };
+
+}
 
 }
 

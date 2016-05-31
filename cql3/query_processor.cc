@@ -205,7 +205,7 @@ query_processor::get_stored_prepared_statement(const std::experimental::string_v
 
 future<::shared_ptr<transport::messages::result_message::prepared>>
 query_processor::store_prepared_statement(const std::experimental::string_view& query_string, const sstring& keyspace,
-        ::shared_ptr<statements::parsed_statement::prepared> prepared, bool for_thrift)
+        ::shared_ptr<statements::prepared_statement> prepared, bool for_thrift)
 {
 #if 0
     // Concatenate the current keyspace so we don't mix prepared statements between keyspace (#5352).
@@ -256,16 +256,16 @@ bytes query_processor::compute_id(const std::experimental::string_view& query_st
     return md5_calculate(to_hash);
 }
 
-::shared_ptr<parsed_statement::prepared>
+::shared_ptr<prepared_statement>
 query_processor::get_statement(const sstring_view& query, const service::client_state& client_state)
 {
 #if 0
         Tracing.trace("Parsing {}", queryStr);
 #endif
-    ::shared_ptr<parsed_statement> statement = parse_statement(query);
+    ::shared_ptr<raw::parsed_statement> statement = parse_statement(query);
 
     // Set keyspace for statement that require login
-    auto cf_stmt = dynamic_pointer_cast<cf_statement>(statement);
+    auto cf_stmt = dynamic_pointer_cast<raw::cf_statement>(statement);
     if (cf_stmt) {
         cf_stmt->prepare_keyspace(client_state);
     }
@@ -276,7 +276,7 @@ query_processor::get_statement(const sstring_view& query, const service::client_
     return statement->prepare(_db.local());
 }
 
-::shared_ptr<parsed_statement>
+::shared_ptr<raw::parsed_statement>
 query_processor::parse_statement(const sstring_view& query)
 {
     try {
@@ -309,7 +309,7 @@ query_processor::parse_statement(const sstring_view& query)
 }
 
 query_options query_processor::make_internal_options(
-                ::shared_ptr<statements::parsed_statement::prepared> p,
+                ::shared_ptr<statements::prepared_statement> p,
                 const std::initializer_list<data_value>& values,
                 db::consistency_level cl) {
     if (p->bound_names.size() != values.size()) {
@@ -330,7 +330,7 @@ query_options query_processor::make_internal_options(
     return query_options(cl, bound_values);
 }
 
-::shared_ptr<statements::parsed_statement::prepared> query_processor::prepare_internal(
+::shared_ptr<statements::prepared_statement> query_processor::prepare_internal(
         const sstring& query_string) {
     auto& p = _internal_statements[query_string];
     if (p == nullptr) {
@@ -352,7 +352,7 @@ future<::shared_ptr<untyped_result_set>> query_processor::execute_internal(
 }
 
 future<::shared_ptr<untyped_result_set>> query_processor::execute_internal(
-        ::shared_ptr<statements::parsed_statement::prepared> p,
+        ::shared_ptr<statements::prepared_statement> p,
         const std::initializer_list<data_value>& values) {
     auto opts = make_internal_options(p, values);
     return do_with(std::move(opts),
@@ -376,7 +376,7 @@ future<::shared_ptr<untyped_result_set>> query_processor::process(
 }
 
 future<::shared_ptr<untyped_result_set>> query_processor::process(
-                ::shared_ptr<statements::parsed_statement::prepared> p,
+                ::shared_ptr<statements::prepared_statement> p,
                 db::consistency_level cl, const std::initializer_list<data_value>& values)
 {
     auto opts = make_internal_options(p, values, cl);
@@ -432,10 +432,9 @@ void query_processor::migration_subscriber::on_update_keyspace(const sstring& ks
 
 void query_processor::migration_subscriber::on_update_column_family(const sstring& ks_name, const sstring& cf_name, bool columns_changed)
 {
-    if (columns_changed) {
-        log.info("Column definitions for {}.{} changed, invalidating related prepared statements", ks_name, cf_name);
-        remove_invalid_prepared_statements(ks_name, cf_name);
-    }
+    // #1255: Ignoring columns_changed deliberately.
+    log.info("Column definitions for {}.{} changed, invalidating related prepared statements", ks_name, cf_name);
+    remove_invalid_prepared_statements(ks_name, cf_name);
 }
 
 void query_processor::migration_subscriber::on_update_user_type(const sstring& ks_name, const sstring& type_name)

@@ -45,6 +45,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptor/map.hpp>
+#include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/algorithm_ext/insert.hpp>
 #include <boost/range/algorithm_ext/push_back.hpp>
 #include <boost/range/algorithm/set_algorithm.hpp>
@@ -162,6 +163,7 @@ std::unordered_map<sstable::component_type, sstring, enum_hash<sstable::componen
     { component_type::Filter, "Filter.db" },
     { component_type::Statistics, "Statistics.db" },
     { component_type::TemporaryTOC, TEMPORARY_TOC_SUFFIX },
+    { component_type::TemporaryStatistics, "Statistics.db.tmp" },
 };
 
 // This assumes that the mappings are small enough, and called unfrequent
@@ -959,6 +961,22 @@ future<> sstable::read_statistics(const io_priority_class& pc) {
 
 void sstable::write_statistics(const io_priority_class& pc) {
     write_simple<component_type::Statistics>(_statistics, pc);
+}
+
+void sstable::rewrite_statistics(const io_priority_class& pc) {
+    auto file_path = filename(component_type::TemporaryStatistics);
+    sstlog.debug("Rewriting statistics component of sstable {}", get_filename());
+    file f = new_sstable_component_file(sstable_write_error, file_path, open_flags::wo | open_flags::create | open_flags::truncate).get0();
+
+    file_output_stream_options options;
+    options.buffer_size = sstable_buffer_size;
+    options.io_priority_class = pc;
+    auto w = file_writer(std::move(f), std::move(options));
+    write(w, _statistics);
+    w.flush().get();
+    w.close().get();
+    // rename() guarantees atomicity when renaming a file into place.
+    sstable_write_io_check(rename_file, file_path, filename(component_type::Statistics)).get();
 }
 
 future<> sstable::read_summary(const io_priority_class& pc) {
@@ -1794,6 +1812,20 @@ double sstable::get_compression_ratio() const {
     }
 }
 
+void sstable::set_sstable_level(uint32_t new_level) {
+    auto entry = _statistics.contents.find(metadata_type::Stats);
+    if (entry == _statistics.contents.end()) {
+        return;
+    }
+    auto& p = entry->second;
+    if (!p) {
+        throw std::runtime_error("Statistics is malformed");
+    }
+    stats_metadata& s = *static_cast<stats_metadata *>(p.get());
+    sstlog.debug("set level of {} with generation {} from {} to {}", get_filename(), _generation, s.sstable_level, new_level);
+    s.sstable_level = new_level;
+}
+
 future<> sstable::mutate_sstable_level(uint32_t new_level) {
     if (!has_component(component_type::Statistics)) {
         return make_ready_future<>();
@@ -1823,7 +1855,7 @@ future<> sstable::mutate_sstable_level(uint32_t new_level) {
         // which comprises mostly hard link creation and this operation at the end + this operation,
         // and also (eventually) by some compaction strategy. In any of the cases, it won't be high
         // priority enough so we will use the default priority
-        write_statistics(default_priority_class());
+        rewrite_statistics(default_priority_class());
     });
 }
 
@@ -1857,7 +1889,13 @@ sstable::~sstable() {
         try {
             delete_atomically({sstable_to_delete(filename(component_type::TOC), _shared)}).handle_exception(
                         [op = background_jobs().start()] (std::exception_ptr eptr) {
-                            sstlog.warn("Exception when deleting sstable file: {}", eptr);
+                            try {
+                                std::rethrow_exception(eptr);
+                            } catch (atomic_deletion_cancelled&) {
+                                sstlog.debug("Exception when deleting sstable file: {}", eptr);
+                            } catch (...) {
+                                sstlog.warn("Exception when deleting sstable file: {}", eptr);
+                            }
                         });
         } catch (...) {
             sstlog.warn("Exception when deleting sstable file: {}", std::current_exception());
@@ -2048,7 +2086,9 @@ do_delete_atomically(std::vector<sstable_to_delete> atomic_deletion_set, unsigne
 
     if (g_atomic_deletions_cancelled) {
         deletion_logger.debug("atomic deletions disabled, erroring out");
-        throw std::runtime_error(sprint("atomic deletions disabled; not deleting %s", atomic_deletion_set));
+        using boost::adaptors::transformed;
+        throw atomic_deletion_cancelled(atomic_deletion_set
+                                        | transformed(std::mem_fn(&sstable_to_delete::name)));
     }
 
     // Insert atomic_deletion_set into the list of sets pending deletion.  If the new set
@@ -2143,11 +2183,20 @@ cancel_atomic_deletions() {
     g_atomic_deletions_cancelled = true;
     for (auto&& pd : g_atomic_deletion_sets) {
         for (auto&& c : pd->completions) {
-            c->set_exception(std::runtime_error(sprint("Atomic sstable deletions cancelled; not deleting %s", pd->names)));
+            c->set_exception(atomic_deletion_cancelled(pd->names));
         }
     }
     g_atomic_deletion_sets.clear();
     g_shards_agreeing_to_delete_sstable.clear();
+}
+
+atomic_deletion_cancelled::atomic_deletion_cancelled(std::vector<sstring> names)
+        : _msg(sprint("atomic deletions cancelled; not deleting %s", names)) {
+}
+
+const char*
+atomic_deletion_cancelled::what() const noexcept {
+    return _msg.c_str();
 }
 
 }

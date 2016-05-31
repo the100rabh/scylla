@@ -780,7 +780,7 @@ void storage_service::on_alive(gms::inet_address endpoint, gms::endpoint_state s
                     logger.warn("Up notification failed {}: {}", endpoint, std::current_exception());
                 }
             }
-        });
+        }).get();
     }
 }
 
@@ -1316,6 +1316,10 @@ future<std::unordered_set<token>> storage_service::prepare_replacement_info() {
 
     // if (!MessagingService.instance().isListening())
     //     MessagingService.instance().listen(FBUtilities.getLocalAddress());
+    auto seeds = gms::get_local_gossiper().get_seeds();
+    if (seeds.size() == 1 && seeds.count(replace_address)) {
+        throw std::runtime_error(sprint("Cannot replace_address %s because no seed node is up", replace_address));
+    }
 
     // make magic happen
     return gms::get_local_gossiper().do_shadow_round().then([this, replace_address] {
@@ -1797,16 +1801,18 @@ future<> storage_service::start_native_transport() {
                 //    return cserver->stop();
                 //});
 
-                ::shared_ptr<seastar::tls::server_credentials> cred;
+                std::shared_ptr<seastar::tls::credentials_builder> cred;
                 auto addr = ipv4_addr{ip, port};
                 auto f = make_ready_future();
 
                 // main should have made sure values are clean and neatish
                 if (ceo.at("enabled") == "true") {
-                    cred = ::make_shared<seastar::tls::server_credentials>(::make_shared<seastar::tls::dh_params>(seastar::tls::dh_params::level::MEDIUM));
+                    cred = std::make_shared<seastar::tls::credentials_builder>();
+                    cred->set_dh_level(seastar::tls::dh_params::level::MEDIUM);
                     f = cred->set_x509_key_file(ceo.at("certificate"), ceo.at("keyfile"), seastar::tls::x509_crt_format::PEM);
+                    logger.info("Enabling encrypted CQL connections between client and server");
                 }
-                return f.then([cserver, addr, cred, keepalive] {
+                return f.then([cserver, addr, cred = std::move(cred), keepalive] {
                     return cserver->invoke_on_all(&transport::cql_server::listen, addr, cred, keepalive);
                 });
             });
@@ -2598,6 +2604,20 @@ future<> storage_service::load_new_sstables(sstring ks_name, sstring cf_name) {
         }).then([new_tables = std::move(new_tables), eptr = std::move(eptr)] {
             if (eptr) {
                 return make_exception_future<std::vector<sstables::entry_descriptor>>(eptr);
+            }
+            return make_ready_future<std::vector<sstables::entry_descriptor>>(std::move(new_tables));
+        });
+    }).then([this, ks_name, cf_name] (std::vector<sstables::entry_descriptor> new_tables) {
+        auto shard = std::hash<sstring>()(cf_name) % smp::count;
+        return _db.invoke_on(shard, [ks_name, cf_name] (database& db) {
+            auto& cf = db.find_column_family(ks_name, cf_name);
+            return cf.flush_upload_dir();
+        }).then([new_tables = std::move(new_tables), ks_name, cf_name] (std::vector<sstables::entry_descriptor> new_tables_from_upload) mutable {
+            if (new_tables_from_upload.empty()) {
+                logger.info("No new SSTables were found for {}.{} in upload directory", ks_name, cf_name);
+            } else {
+                // merge new sstables found in both column family and upload directories.
+                new_tables.insert(new_tables.end(), new_tables_from_upload.begin(), new_tables_from_upload.end());
             }
             return make_ready_future<std::vector<sstables::entry_descriptor>>(std::move(new_tables));
         });

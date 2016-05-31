@@ -262,13 +262,13 @@ public:
         int64_t live_sstable_count = 0;
         /** Estimated number of compactions pending for this column family */
         int64_t pending_compactions = 0;
-        utils::ihistogram reads{256};
-        utils::ihistogram writes{256};
+        utils::timed_rate_moving_average_and_histogram reads{256};
+        utils::timed_rate_moving_average_and_histogram writes{256};
         sstables::estimated_histogram estimated_read;
         sstables::estimated_histogram estimated_write;
         sstables::estimated_histogram estimated_sstable_per_read;
-        utils::ihistogram tombstone_scanned;
-        utils::ihistogram live_scanned;
+        utils::timed_rate_moving_average_and_histogram tombstone_scanned;
+        utils::timed_rate_moving_average_and_histogram live_scanned;
     };
 
     struct snapshot_details {
@@ -300,6 +300,7 @@ private:
     // server.
     lw_shared_ptr<memtable_list> _streaming_memtables;
 
+    lw_shared_ptr<memtable_list> make_memory_only_memtable_list();
     lw_shared_ptr<memtable_list> make_memtable_list();
     lw_shared_ptr<memtable_list> make_streaming_memtable_list();
 
@@ -322,8 +323,6 @@ private:
     db::commitlog* _commitlog;
     sstables::compaction_strategy _compaction_strategy;
     compaction_manager& _compaction_manager;
-    // Whether or not a cf is queued by its compaction manager.
-    bool _compaction_manager_queued = false;
     int _compaction_disabled = 0;
     class memtable_flush_queue;
     std::unique_ptr<memtable_flush_queue> _flush_queue;
@@ -369,7 +368,10 @@ private:
     // Caller needs to ensure that column_family remains live (FIXME: relax this).
     // The 'range' parameter must be live as long as the reader is used.
     // Mutations returned by the reader will all have given schema.
-    mutation_reader make_sstable_reader(schema_ptr schema, const query::partition_range& range, const io_priority_class& pc) const;
+    mutation_reader make_sstable_reader(schema_ptr schema,
+                                        const query::partition_range& range,
+                                        query::clustering_key_filtering_context ck_filtering,
+                                        const io_priority_class& pc) const;
 
     mutation_source sstables_as_mutation_source();
     key_source sstables_as_key_source() const;
@@ -407,6 +409,7 @@ public:
     // will be scheduled under the priority class given by pc.
     mutation_reader make_reader(schema_ptr schema,
             const query::partition_range& range = query::full_partition_range,
+            const query::clustering_key_filtering_context& ck_filtering = query::no_clustering_key_filtering,
             const io_priority_class& pc = default_priority_class()) const;
 
     mutation_source as_mutation_source() const;
@@ -427,9 +430,13 @@ public:
     }
 
     logalloc::occupancy_stats occupancy() const;
+private:
+    column_family(schema_ptr schema, config cfg, db::commitlog* cl, compaction_manager&);
 public:
-    column_family(schema_ptr schema, config cfg, db::commitlog& cl, compaction_manager&);
-    column_family(schema_ptr schema, config cfg, no_commitlog, compaction_manager&);
+    column_family(schema_ptr schema, config cfg, db::commitlog& cl, compaction_manager& cm)
+        : column_family(schema, std::move(cfg), &cl, cm) {}
+    column_family(schema_ptr schema, config cfg, no_commitlog, compaction_manager& cm)
+        : column_family(schema, std::move(cfg), nullptr, cm) {}
     column_family(column_family&&) = delete; // 'this' is being captured during construction
     ~column_family();
     const schema_ptr& schema() const { return _schema; }
@@ -482,6 +489,17 @@ public:
         _sstables_lock.write_unlock();
         return std::chrono::steady_clock::now() - _sstable_writes_disabled_at;
     }
+
+    // This function will iterate through upload directory in column family,
+    // and will do the following for each sstable found:
+    // 1) Mutate sstable level to 0.
+    // 2) Create hard links to its components in column family dir.
+    // 3) Remove all of its components in upload directory.
+    // At the end, it's expected that upload dir is empty and all of its
+    // previous content was moved to column family dir.
+    //
+    // Return a vector containing descriptor of sstables to be loaded.
+    future<std::vector<sstables::entry_descriptor>> flush_upload_dir();
 
     // Make sure the generation numbers are sequential, starting from "start".
     // Generations before "start" are left untouched.
@@ -546,8 +564,6 @@ public:
         return _compaction_strategy;
     }
 
-    bool compaction_manager_queued() const;
-    void set_compaction_manager_queued(bool compaction_manager_queued);
     bool pending_compactions() const;
 
     const stats& get_stats() const {
@@ -738,10 +754,24 @@ public:
         : _metadata(std::move(metadata))
         , _config(std::move(cfg))
     {}
-    const lw_shared_ptr<keyspace_metadata>& metadata() const {
+
+    void update_from(lw_shared_ptr<keyspace_metadata>);
+
+    /** Note: return by shared pointer value, since the meta data is
+     * semi-volatile. I.e. we could do alter keyspace at any time, and
+     * boom, it is replaced.
+     */
+    lw_shared_ptr<keyspace_metadata> metadata() const {
         return _metadata;
     }
     void create_replication_strategy(const std::map<sstring, sstring>& options);
+    /**
+     * This should not really be return by reference, since replication
+     * strategy is also volatile in that it could be replaced at "any" time.
+     * However, all current uses at least are "instantateous", i.e. does not
+     * carry it across a continuation. So it is sort of same for now, but
+     * should eventually be refactored.
+     */
     locator::abstract_replication_strategy& get_replication_strategy();
     const locator::abstract_replication_strategy& get_replication_strategy() const;
     column_family::config make_column_family_config(const schema& s) const;
@@ -770,7 +800,7 @@ public:
     const sstring& datadir() const {
         return _config.datadir;
     }
-private:
+
     sstring column_family_directory(const sstring& name, utils::UUID uuid) const;
 };
 
@@ -799,15 +829,16 @@ class database {
 
     lw_shared_ptr<db_stats> _stats;
 
+    std::unique_ptr<db::config> _cfg;
+    size_t _memtable_total_space = 500 << 20;
+    size_t _streaming_memtable_total_space = 500 << 20;
     logalloc::region_group _dirty_memory_region_group;
     logalloc::region_group _streaming_dirty_memory_region_group;
+
     std::unordered_map<sstring, keyspace> _keyspaces;
     std::unordered_map<utils::UUID, lw_shared_ptr<column_family>> _column_families;
     std::unordered_map<std::pair<sstring, sstring>, utils::UUID, utils::tuple_hash> _ks_cf_to_uuid;
     std::unique_ptr<db::commitlog> _commitlog;
-    std::unique_ptr<db::config> _cfg;
-    size_t _memtable_total_space = 500 << 20;
-    size_t _streaming_memtable_total_space = 500 << 20;
     utils::UUID _version;
     // compaction_manager object is referenced by all column families of a database.
     compaction_manager _compaction_manager;
@@ -876,7 +907,7 @@ public:
     keyspace& find_keyspace(const sstring& name);
     const keyspace& find_keyspace(const sstring& name) const;
     bool has_keyspace(const sstring& name) const;
-    void update_keyspace(const sstring& name);
+    future<> update_keyspace(const sstring& name);
     void drop_keyspace(const sstring& name);
     const auto& keyspaces() const { return _keyspaces; }
     std::vector<sstring> get_non_system_keyspaces() const;

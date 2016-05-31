@@ -40,6 +40,7 @@
  */
 
 #include "cql3/statements/select_statement.hh"
+#include "cql3/statements/raw/select_statement.hh"
 
 #include "transport/messages/result_message.hh"
 #include "cql3/selection/selection.hh"
@@ -117,7 +118,7 @@ select_statement::for_selection(schema_ptr schema, ::shared_ptr<selection::selec
         ::shared_ptr<term>{});
 }
 
-::shared_ptr<cql3::metadata> select_statement::get_result_metadata() const {
+::shared_ptr<const cql3::metadata> select_statement::get_result_metadata() const {
     // FIXME: COUNT needs special result metadata handling.
     return _selection->get_result_metadata();
 }
@@ -221,7 +222,7 @@ select_statement::execute(distributed<service::storage_proxy>& proxy, service::q
     auto now = db_clock::now();
 
     auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(),
-        make_partition_slice(options), limit, to_gc_clock(now));
+        make_partition_slice(options), limit, to_gc_clock(now), options.get_timestamp(state));
 
     int32_t page_size = options.get_page_size();
 
@@ -313,7 +314,7 @@ select_statement::execute_internal(distributed<service::storage_proxy>& proxy, s
     int32_t limit = get_limit(options);
     auto now = db_clock::now();
     auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(),
-        make_partition_slice(options), limit);
+        make_partition_slice(options), limit, to_gc_clock(now), options.get_timestamp(state));
     auto partition_ranges = _restrictions->get_partition_key_ranges(options);
 
     if (needs_post_query_ordering() && _limit) {
@@ -356,7 +357,9 @@ shared_ptr<transport::messages::result_message> select_statement::process_result
     return ::make_shared<transport::messages::result_message::rows>(std::move(rs));
 }
 
-select_statement::raw_statement::raw_statement(::shared_ptr<cf_name> cf_name,
+namespace raw {
+
+select_statement::select_statement(::shared_ptr<cf_name> cf_name,
                                                ::shared_ptr<parameters> parameters,
                                                std::vector<::shared_ptr<selection::raw_selector>> select_clause,
                                                std::vector<::shared_ptr<relation>> where_clause,
@@ -368,8 +371,8 @@ select_statement::raw_statement::raw_statement(::shared_ptr<cf_name> cf_name,
     , _limit(std::move(limit))
 { }
 
-::shared_ptr<parsed_statement::prepared>
-select_statement::raw_statement::prepare(database& db) {
+::shared_ptr<prepared_statement>
+select_statement::prepare(database& db) {
     schema_ptr schema = validation::validate_column_family(db, keyspace(), column_family());
     auto bound_names = get_bound_variables();
 
@@ -394,7 +397,7 @@ select_statement::raw_statement::prepare(database& db) {
 
     check_needs_filtering(restrictions);
 
-    auto stmt = ::make_shared<select_statement>(schema,
+    auto stmt = ::make_shared<cql3::statements::select_statement>(schema,
         bound_names->size(),
         _parameters,
         std::move(selection),
@@ -403,11 +406,11 @@ select_statement::raw_statement::prepare(database& db) {
         std::move(ordering_comparator),
         prepare_limit(db, bound_names));
 
-    return ::make_shared<parsed_statement::prepared>(std::move(stmt), std::move(*bound_names));
+    return ::make_shared<prepared>(std::move(stmt), std::move(*bound_names));
 }
 
 ::shared_ptr<restrictions::statement_restrictions>
-select_statement::raw_statement::prepare_restrictions(database& db, schema_ptr schema,
+select_statement::prepare_restrictions(database& db, schema_ptr schema,
     ::shared_ptr<variable_specifications> bound_names,
     ::shared_ptr<selection::selection> selection)
 {
@@ -424,7 +427,7 @@ select_statement::raw_statement::prepare_restrictions(database& db, schema_ptr s
 
 /** Returns a ::shared_ptr<term> for the limit or null if no limit is set */
 ::shared_ptr<term>
-select_statement::raw_statement::prepare_limit(database& db, ::shared_ptr<variable_specifications> bound_names) {
+select_statement::prepare_limit(database& db, ::shared_ptr<variable_specifications> bound_names) {
     if (!_limit) {
         return {};
     }
@@ -434,7 +437,7 @@ select_statement::raw_statement::prepare_limit(database& db, ::shared_ptr<variab
     return prep_limit;
 }
 
-void select_statement::raw_statement::verify_ordering_is_allowed(
+void select_statement::verify_ordering_is_allowed(
     ::shared_ptr<restrictions::statement_restrictions> restrictions)
 {
     if (restrictions->uses_secondary_indexing()) {
@@ -445,7 +448,7 @@ void select_statement::raw_statement::verify_ordering_is_allowed(
     }
 }
 
-void select_statement::raw_statement::validate_distinct_selection(schema_ptr schema,
+void select_statement::validate_distinct_selection(schema_ptr schema,
     ::shared_ptr<selection::selection> selection,
     ::shared_ptr<restrictions::statement_restrictions> restrictions)
 {
@@ -471,7 +474,7 @@ void select_statement::raw_statement::validate_distinct_selection(schema_ptr sch
     }
 }
 
-void select_statement::raw_statement::handle_unrecognized_ordering_column(
+void select_statement::handle_unrecognized_ordering_column(
     ::shared_ptr<column_identifier> column)
 {
     if (contains_alias(column)) {
@@ -481,7 +484,7 @@ void select_statement::raw_statement::handle_unrecognized_ordering_column(
 }
 
 select_statement::ordering_comparator_type
-select_statement::raw_statement::get_ordering_comparator(schema_ptr schema,
+select_statement::get_ordering_comparator(schema_ptr schema,
     ::shared_ptr<selection::selection> selection,
     ::shared_ptr<restrictions::statement_restrictions> restrictions)
 {
@@ -530,7 +533,7 @@ select_statement::raw_statement::get_ordering_comparator(schema_ptr schema,
     };
 }
 
-bool select_statement::raw_statement::is_reversed(schema_ptr schema) {
+bool select_statement::is_reversed(schema_ptr schema) {
 
     assert(_parameters->orderings().size() > 0);
     parameters::orderings_type::size_type i = 0;
@@ -576,7 +579,7 @@ bool select_statement::raw_statement::is_reversed(schema_ptr schema) {
 }
 
 /** If ALLOW FILTERING was not specified, this verifies that it is not needed */
-void select_statement::raw_statement::check_needs_filtering(
+void select_statement::check_needs_filtering(
     ::shared_ptr<restrictions::statement_restrictions> restrictions)
 {
     // non-key-range non-indexed queries cannot involve filtering underneath
@@ -593,16 +596,17 @@ void select_statement::raw_statement::check_needs_filtering(
     }
 }
 
-bool select_statement::raw_statement::contains_alias(::shared_ptr<column_identifier> name) {
+bool select_statement::contains_alias(::shared_ptr<column_identifier> name) {
     return std::any_of(_select_clause.begin(), _select_clause.end(), [name] (auto raw) {
         return raw->alias && *name == *raw->alias;
     });
 }
 
-::shared_ptr<column_specification> select_statement::raw_statement::limit_receiver() {
+::shared_ptr<column_specification> select_statement::limit_receiver() {
     return ::make_shared<column_specification>(keyspace(), column_family(), ::make_shared<column_identifier>("[limit]", true),
         int32_type);
 }
 
+}
 }
 }

@@ -23,8 +23,7 @@
 #pragma once
 
 #include "cql3/result_set.hh"
-#include "cql3/statements/parsed_statement.hh"
-#include "cql3/statements/select_statement.hh"
+#include "cql3/statements/prepared_statement.hh"
 
 #include "transport/messages/result_message_base.hh"
 #include "transport/event.hh"
@@ -81,14 +80,15 @@ public:
 class result_message::prepared : public result_message {
 private:
     bytes _id;
-    ::shared_ptr<cql3::statements::parsed_statement::prepared> _prepared;
-    ::shared_ptr<cql3::metadata> _metadata;
-    ::shared_ptr<cql3::metadata> _result_metadata;
+    ::shared_ptr<cql3::statements::prepared_statement> _prepared;
+    ::shared_ptr<cql3::prepared_metadata> _metadata;
+    ::shared_ptr<const cql3::metadata> _result_metadata;
 public:
-    prepared(const bytes& id, ::shared_ptr<cql3::statements::parsed_statement::prepared> prepared)
+    prepared(const bytes& id, ::shared_ptr<cql3::statements::prepared_statement> prepared)
         : _id{id}
         , _prepared{prepared}
-        , _metadata{::make_shared<cql3::metadata>(prepared->bound_names)}
+        // FIXME: Populate partition key bind indices for prepared_metadata.
+        , _metadata{::make_shared<cql3::prepared_metadata>(prepared->bound_names, std::vector<uint16_t>())}
         , _result_metadata{extract_result_metadata(prepared->statement)}
     { }
 
@@ -96,15 +96,15 @@ public:
         return _id;
     }
 
-    const ::shared_ptr<cql3::statements::parsed_statement::prepared>& get_prepared() const {
+    const ::shared_ptr<cql3::statements::prepared_statement>& get_prepared() const {
         return _prepared;
     }
 
-    ::shared_ptr<cql3::metadata> metadata() const {
+    ::shared_ptr<cql3::prepared_metadata> metadata() const {
         return _metadata;
     }
 
-    ::shared_ptr<cql3::metadata> result_metadata() const {
+    ::shared_ptr<const cql3::metadata> result_metadata() const {
         return _result_metadata;
     }
 
@@ -112,12 +112,8 @@ public:
         v.visit(*this);
     }
 private:
-    static ::shared_ptr<cql3::metadata> extract_result_metadata(::shared_ptr<cql3::cql_statement> statement) {
-        auto select_stmt = dynamic_cast<cql3::statements::select_statement*>(statement.get());
-        if (!select_stmt) {
-            return cql3::make_empty_metadata();
-        }
-        return select_stmt->get_result_metadata();
+    static ::shared_ptr<const cql3::metadata> extract_result_metadata(::shared_ptr<cql3::cql_statement> statement) {
+        return statement->get_result_metadata();
     }
 };
 

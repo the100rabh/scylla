@@ -88,6 +88,13 @@ public:
 };
 
 lw_shared_ptr<memtable_list>
+column_family::make_memory_only_memtable_list() {
+    auto seal = [this] { return make_ready_future<>(); };
+    auto get_schema = [this] { return schema(); };
+    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.max_memtable_size, _config.dirty_memory_region_group);
+}
+
+lw_shared_ptr<memtable_list>
 column_family::make_memtable_list() {
     auto seal = [this] { return seal_active_memtable(); };
     auto get_schema = [this] { return schema(); };
@@ -101,30 +108,14 @@ column_family::make_streaming_memtable_list() {
     return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.max_streaming_memtable_size, _config.streaming_dirty_memory_region_group);
 }
 
-column_family::column_family(schema_ptr schema, config config, db::commitlog& cl, compaction_manager& compaction_manager)
+column_family::column_family(schema_ptr schema, config config, db::commitlog* cl, compaction_manager& compaction_manager)
     : _schema(std::move(schema))
     , _config(std::move(config))
-    , _memtables(make_memtable_list())
-    , _streaming_memtables(_config.enable_disk_writes ? make_streaming_memtable_list() : make_memtable_list())
+    , _memtables(_config.enable_disk_writes ? make_memtable_list() : make_memory_only_memtable_list())
+    , _streaming_memtables(_config.enable_disk_writes ? make_streaming_memtable_list() : make_memory_only_memtable_list())
     , _sstables(make_lw_shared<sstable_list>())
     , _cache(_schema, sstables_as_mutation_source(), sstables_as_key_source(), global_cache_tracker())
-    , _commitlog(&cl)
-    , _compaction_manager(compaction_manager)
-    , _flush_queue(std::make_unique<memtable_flush_queue>())
-{
-    if (!_config.enable_disk_writes) {
-        dblog.warn("Writes disabled, column family no durable.");
-    }
-}
-
-column_family::column_family(schema_ptr schema, config config, no_commitlog cl, compaction_manager& compaction_manager)
-    : _schema(std::move(schema))
-    , _config(std::move(config))
-    , _memtables(make_memtable_list())
-    , _streaming_memtables(_config.enable_disk_writes ? make_streaming_memtable_list() : make_memtable_list())
-    , _sstables(make_lw_shared<sstable_list>())
-    , _cache(_schema, sstables_as_mutation_source(), sstables_as_key_source(), global_cache_tracker())
-    , _commitlog(nullptr)
+    , _commitlog(cl)
     , _compaction_manager(compaction_manager)
     , _flush_queue(std::make_unique<memtable_flush_queue>())
 {
@@ -147,8 +138,11 @@ column_family::make_partition_presence_checker(lw_shared_ptr<sstable_list> old_s
 
 mutation_source
 column_family::sstables_as_mutation_source() {
-    return mutation_source([this] (schema_ptr s, const query::partition_range& r, const io_priority_class& pc) {
-        return make_sstable_reader(std::move(s), r, pc);
+    return mutation_source([this] (schema_ptr s,
+                                   const query::partition_range& r,
+                                   query::clustering_key_filtering_context ck_filtering,
+                                   const io_priority_class& pc) {
+        return make_sstable_reader(std::move(s), r, ck_filtering, pc);
     });
 }
 
@@ -180,16 +174,23 @@ class range_sstable_reader final : public mutation_reader::impl {
     // Use a pointer instead of copying, so we don't need to regenerate the reader if
     // the priority changes.
     const io_priority_class& _pc;
+    query::clustering_key_filtering_context _ck_filtering;
 public:
-    range_sstable_reader(schema_ptr s, lw_shared_ptr<sstable_list> sstables, const query::partition_range& pr, const io_priority_class& pc)
+    range_sstable_reader(schema_ptr s,
+                         lw_shared_ptr<sstable_list> sstables,
+                         const query::partition_range& pr,
+                         query::clustering_key_filtering_context ck_filtering,
+                         const io_priority_class& pc)
         : _pr(pr)
         , _sstables(std::move(sstables))
         , _pc(pc)
+        , _ck_filtering(ck_filtering)
     {
         std::vector<mutation_reader> readers;
         for (const lw_shared_ptr<sstables::sstable>& sst : *_sstables | boost::adaptors::map_values) {
             // FIXME: make sstable::read_range_rows() return ::mutation_reader so that we can drop this wrapper.
-            mutation_reader reader = make_mutation_reader<sstable_range_wrapping_reader>(sst, s, pr, pc);
+            mutation_reader reader =
+                make_mutation_reader<sstable_range_wrapping_reader>(sst, s, pr, _ck_filtering, _pc);
             if (sst->is_shared()) {
                 reader = make_filtering_reader(std::move(reader), belongs_to_current_shard);
             }
@@ -214,22 +215,30 @@ class single_key_sstable_reader final : public mutation_reader::impl {
     // Use a pointer instead of copying, so we don't need to regenerate the reader if
     // the priority changes.
     const io_priority_class& _pc;
+    query::clustering_key_filtering_context _ck_filtering;
 public:
-    single_key_sstable_reader(schema_ptr schema, lw_shared_ptr<sstable_list> sstables, const partition_key& key, const io_priority_class& pc)
+    single_key_sstable_reader(schema_ptr schema,
+                              lw_shared_ptr<sstable_list> sstables,
+                              const partition_key& key,
+                              query::clustering_key_filtering_context ck_filtering,
+                              const io_priority_class& pc)
         : _schema(std::move(schema))
         , _key(sstables::key::from_partition_key(*_schema, key))
         , _sstables(std::move(sstables))
         , _pc(pc)
+        , _ck_filtering(ck_filtering)
     { }
 
     virtual future<mutation_opt> operator()() override {
         if (_done) {
             return make_ready_future<mutation_opt>();
         }
-        return parallel_for_each(*_sstables | boost::adaptors::map_values, [this](const lw_shared_ptr<sstables::sstable>& sstable) {
-            return sstable->read_row(_schema, _key, _pc).then([this](mutation_opt mo) {
-                apply(_m, std::move(mo));
-            });
+        return parallel_for_each(*_sstables | boost::adaptors::map_values,
+            [this](const lw_shared_ptr<sstables::sstable>& sstable) {
+                return sstable->read_row(_schema, _key, _ck_filtering, _pc)
+                    .then([this](mutation_opt mo) {
+                        apply(_m, std::move(mo));
+                });
         }).then([this] {
             _done = true;
             return std::move(_m);
@@ -238,16 +247,19 @@ public:
 };
 
 mutation_reader
-column_family::make_sstable_reader(schema_ptr s, const query::partition_range& pr, const io_priority_class& pc) const {
+column_family::make_sstable_reader(schema_ptr s,
+                                   const query::partition_range& pr,
+                                   query::clustering_key_filtering_context ck_filtering,
+                                   const io_priority_class& pc) const {
     if (pr.is_singular() && pr.start()->value().has_key()) {
         const dht::ring_position& pos = pr.start()->value();
         if (dht::shard_of(pos.token()) != engine().cpu_id()) {
             return make_empty_reader(); // range doesn't belong to this shard
         }
-        return make_mutation_reader<single_key_sstable_reader>(std::move(s), _sstables, *pos.key(), pc);
+        return make_mutation_reader<single_key_sstable_reader>(std::move(s), _sstables, *pos.key(), ck_filtering, pc);
     } else {
         // range_sstable_reader is not movable so we need to wrap it
-        return make_mutation_reader<range_sstable_reader>(std::move(s), _sstables, pr, pc);
+        return make_mutation_reader<range_sstable_reader>(std::move(s), _sstables, pr, ck_filtering, pc);
     }
 }
 
@@ -306,7 +318,10 @@ column_family::find_row(schema_ptr s, const dht::decorated_key& partition_key, c
 }
 
 mutation_reader
-column_family::make_reader(schema_ptr s, const query::partition_range& range, const io_priority_class& pc) const {
+column_family::make_reader(schema_ptr s,
+                           const query::partition_range& range,
+                           const query::clustering_key_filtering_context& ck_filtering,
+                           const io_priority_class& pc) const {
     if (query::is_wrap_around(range, *s)) {
         // make_combined_reader() can't handle streams that wrap around yet.
         fail(unimplemented::cause::WRAP_AROUND);
@@ -336,13 +351,13 @@ column_family::make_reader(schema_ptr s, const query::partition_range& range, co
     // https://github.com/scylladb/scylla/issues/185
 
     for (auto&& mt : *_memtables) {
-        readers.emplace_back(mt->make_reader(s, range, pc));
+        readers.emplace_back(mt->make_reader(s, range, ck_filtering, pc));
     }
 
     if (_config.enable_cache) {
-        readers.emplace_back(_cache.make_reader(s, range, pc));
+        readers.emplace_back(_cache.make_reader(s, range, ck_filtering, pc));
     } else {
-        readers.emplace_back(make_sstable_reader(s, range, pc));
+        readers.emplace_back(make_sstable_reader(s, range, ck_filtering, pc));
     }
 
     return make_combined_reader(std::move(readers));
@@ -456,12 +471,6 @@ future<> lister::scan_dir(sstring name, lister::dir_entry_types type, walker_typ
             auto l = make_lw_shared<lister>(std::move(f), type, walker, filter, name);
             return l->done().then([l] { });
     });
-}
-
-static std::vector<sstring> parse_fname(sstring filename) {
-    std::vector<sstring> comps;
-    boost::split(comps , filename ,boost::is_any_of(".-"));
-    return comps;
 }
 
 static bool belongs_to_current_shard(const schema& s, const partition_key& first, const partition_key& last) {
@@ -662,10 +671,6 @@ column_family::seal_active_memtable() {
     auto old = _memtables->back();
     dblog.debug("Sealing active memtable, partitions: {}, occupancy: {}", old->partition_count(), old->occupancy());
 
-    if (!_config.enable_disk_writes) {
-       return make_ready_future<>();
-    }
-
     if (old->empty()) {
         dblog.debug("Memtable is empty");
         return make_ready_future<>();
@@ -766,6 +771,12 @@ column_family::start() {
 
 future<>
 column_family::stop() {
+    // Please note that in here, we shouldn't use the implicit seal function in each memtable's
+    // list. The reason is that for the streaming memtables, the memtable_list's seal function does
+    // not guarantee anything to be immediately flushed, and will set a timer instead (so we can
+    // coalesce writes). During stop, we need to force flushing behavior so we call
+    // seal_active_streaming_memtable() instead. That problem does not exist for memtables and we
+    // could call _memtables->seal_active_memtable() here. We don't, for consistency with streaming.
     seal_active_memtable();
     seal_active_streaming_memtable();
     return _compaction_manager.remove(this).then([this] {
@@ -778,6 +789,51 @@ column_family::stop() {
     });
 }
 
+future<std::vector<sstables::entry_descriptor>> column_family::flush_upload_dir() {
+    struct work {
+        sstable_list sstables;
+        std::unordered_map<int64_t, sstables::entry_descriptor> descriptors;
+        std::vector<sstables::entry_descriptor> flushed;
+    };
+
+    return do_with(work(), [this] (work& work) {
+        return lister::scan_dir(_config.datadir + "/upload/", { directory_entry_type::regular },
+                [this, &work] (directory_entry de) {
+            auto comps = sstables::entry_descriptor::make_descriptor(de.name);
+            if (comps.component != sstables::sstable::component_type::TOC) {
+                return make_ready_future<>();
+            }
+            auto sst = make_lw_shared<sstables::sstable>(_schema->ks_name(), _schema->cf_name(),
+                                                        _config.datadir + "/upload", comps.generation,
+                                                        comps.version, comps.format);
+            work.sstables.emplace(comps.generation, std::move(sst));
+            work.descriptors.emplace(comps.generation, std::move(comps));
+            return make_ready_future<>();
+        }, &manifest_json_filter).then([this, &work] {
+            work.flushed.reserve(work.descriptors.size());
+
+            return do_for_each(work.sstables, [this, &work] (auto& pair) {
+                auto gen = this->calculate_generation_for_new_table();
+                auto& sst = pair.second;
+
+                auto&& comps = std::move(work.descriptors.at(pair.first));
+                comps.generation = gen;
+                work.flushed.push_back(std::move(comps));
+
+                // Read toc content as it will be needed for moving and deleting a sstable.
+                return sst->read_toc().then([&sst] {
+                    return sst->mutate_sstable_level(0);
+                }).then([this, &sst, gen] {
+                    return sst->create_links(_config.datadir, gen);
+                }).then([&sst] {
+                    return sstables::remove_by_toc_name(sst->toc_filename());
+                });
+            });
+        }).then([&work] {
+            return make_ready_future<std::vector<sstables::entry_descriptor>>(std::move(work.flushed));
+        });
+    });
+}
 
 future<std::vector<sstables::entry_descriptor>>
 column_family::reshuffle_sstables(std::set<int64_t> all_generations, int64_t start) {
@@ -905,6 +961,12 @@ column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>&
             });
             _sstables_compacted_but_not_deleted.erase(e, _sstables_compacted_but_not_deleted.end());
             rebuild_statistics();
+        }).handle_exception([] (std::exception_ptr e) {
+            try {
+                std::rethrow_exception(e);
+            } catch (sstables::atomic_deletion_cancelled& adc) {
+                dblog.debug("Failed to delete sstables after compaction: {}", adc);
+            }
         });
     });
 }
@@ -973,7 +1035,13 @@ column_family::load_new_sstables(std::vector<sstables::entry_descriptor> new_tab
     return parallel_for_each(new_tables, [this] (auto comps) {
         auto sst = make_lw_shared<sstables::sstable>(_schema->ks_name(), _schema->cf_name(), _config.datadir, comps.generation, comps.version, comps.format);
         return sst->load().then([this, sst] {
-            return sst->mutate_sstable_level(0);
+            // This sets in-memory level of sstable to 0.
+            // When loading a migrated sstable, it's important to set it to level 0 because
+            // leveled compaction relies on a level > 0 having no overlapping sstables.
+            // If Scylla reboots before migrated sstable gets compacted, leveled strategy
+            // is smart enough to detect a sstable that overlaps and set its in-memory
+            // level to 0.
+            return sst->set_sstable_level(0);
         }).then([this, sst] {
             auto first = sst->get_first_partition_key(*_schema);
             auto last = sst->get_last_partition_key(*_schema);
@@ -984,6 +1052,10 @@ column_family::load_new_sstables(std::vector<sstables::entry_descriptor> new_tab
             }
             return make_ready_future<>();
         });
+    }).then([this] {
+        // Drop entire cache for this column family because it may be populated
+        // with stale data.
+        get_row_cache().clear();
     });
 }
 
@@ -1032,14 +1104,6 @@ future<> column_family::run_compaction(sstables::compaction_descriptor descripto
 
 void column_family::set_compaction_strategy(sstables::compaction_strategy_type strategy) {
     _compaction_strategy = make_compaction_strategy(strategy, _schema->compaction_strategy_options());
-}
-
-bool column_family::compaction_manager_queued() const {
-    return _compaction_manager_queued;
-}
-
-void column_family::set_compaction_manager_queued(bool compaction_manager_queued) {
-    _compaction_manager_queued = compaction_manager_queued;
 }
 
 bool column_family::pending_compactions() const {
@@ -1113,7 +1177,12 @@ future<> column_family::populate(sstring sstdir) {
     return do_with(std::vector<future<>>(), [this, sstdir, verifier, descriptor] (std::vector<future<>>& futures) {
         return lister::scan_dir(sstdir, { directory_entry_type::regular }, [this, sstdir, verifier, descriptor, &futures] (directory_entry de) {
             // FIXME: The secondary indexes are in this level, but with a directory type, (starting with ".")
-            auto f = probe_file(sstdir, de.name).then([verifier, descriptor] (auto entry) {
+            auto f = probe_file(sstdir, de.name).then([verifier, descriptor, sstdir] (auto entry) {
+                if (entry.component == sstables::sstable::component_type::TemporaryStatistics) {
+                    return remove_file(sstables::sstable::filename(sstdir, entry.ks, entry.cf, entry.version, entry.generation,
+                        entry.format, sstables::sstable::component_type::TemporaryStatistics));
+                }
+
                 if (verifier->count(entry.generation)) {
                     if (verifier->at(entry.generation) == status::has_toc_file) {
                         if (entry.component == sstables::sstable::component_type::TOC) {
@@ -1143,6 +1212,7 @@ future<> column_family::populate(sstring sstdir) {
                 if (!descriptor->format) {
                     descriptor->format = entry.format;
                 }
+                return make_ready_future<>();
             });
 
             // push future returned by probe_file into an array of futures,
@@ -1205,8 +1275,7 @@ database::database() : database(db::config())
 {}
 
 database::database(const db::config& cfg)
-    : _streaming_dirty_memory_region_group(&_dirty_memory_region_group)
-    , _cfg(std::make_unique<db::config>(cfg))
+    : _cfg(std::make_unique<db::config>(cfg))
     , _memtable_total_space([this] {
         _stats = make_lw_shared<db_stats>();
 
@@ -1217,6 +1286,7 @@ database::database(const db::config& cfg)
         return memtable_total_space;
     }())
     , _streaming_memtable_total_space(_memtable_total_space / 4)
+    , _streaming_dirty_memory_region_group(&_dirty_memory_region_group)
     , _version(empty_version)
     , _enable_incremental_backups(cfg.incremental_backups())
     , _memtables_throttler(_memtable_total_space, _dirty_memory_region_group)
@@ -1225,8 +1295,7 @@ database::database(const db::config& cfg)
                            &_memtables_throttler
     )
 {
-    // Start compaction manager with two tasks for handling compaction jobs.
-    _compaction_manager.start(2);
+    _compaction_manager.start();
     setup_collectd();
 
     dblog.info("Row: max_vector_size: {}, internal_count: {}", size_t(row::max_vector_size), size_t(row::internal_count));
@@ -1287,48 +1356,29 @@ future<> database::populate_keyspace(sstring datadir, sstring ks_name) {
     auto i = _keyspaces.find(ks_name);
     if (i == _keyspaces.end()) {
         dblog.warn("Skipping undefined keyspace: {}", ks_name);
+        return make_ready_future<>();
     } else {
         dblog.info("Populating Keyspace {}", ks_name);
-        return lister::scan_dir(ksdir, { directory_entry_type::directory }, [this, ksdir, ks_name] (directory_entry de) {
-            auto comps = parse_fname(de.name);
-            if (comps.size() < 2) {
-                dblog.error("Keyspace {}: Skipping malformed CF {} ", ksdir, de.name);
-                return make_ready_future<>();
-            }
-
-            sstring cfname = comps[0];
-            sstring uuidst = comps[1];
-
-            try {
-                auto&& uuid = [&] {
-                    try {
-                        return find_uuid(ks_name, cfname);
-                    } catch (const std::out_of_range& e) {
-                        std::throw_with_nested(no_such_column_family(ks_name, cfname));
-                    }
-                }();
-                auto& cf = find_column_family(uuid);
-
-                // #870: Check that the directory name matches
-                // the current, expected UUID of the CF.
-                if (utils::UUID(uuidst) == uuid) {
-                    // FIXME: Increase parallelism.
-                    auto sstdir = ksdir + "/" + de.name;
-                    dblog.info("Keyspace {}: Reading CF {} ", ksdir, cfname);
-                    return cf.populate(sstdir);
-                }
-                // Nope. Warn and ignore.
-                dblog.info("Keyspace {}: Skipping obsolete version of CF {} ({})", ksdir, cfname, uuidst);
-            } catch (marshal_exception&) {
-                // Bogus UUID part of directory name
-                dblog.warn("{}, CF {}: malformed UUID: {}. Ignoring", ksdir, comps[0], uuidst);
-            } catch (no_such_column_family&) {
-                dblog.warn("{}, CF {}: schema not loaded!", ksdir, comps[0]);
-            }
-            return make_ready_future<>();
-        });
+        auto& ks = i->second;
+        return parallel_for_each(std::cbegin(_column_families), std::cend(_column_families),
+            [ks_name, &ks] (const std::pair<utils::UUID, lw_shared_ptr<column_family>>& e) {
+                utils::UUID uuid = e.first;
+                lw_shared_ptr<column_family> cf = e.second;
+                sstring cfname = cf->schema()->cf_name();
+                auto sstdir = ks.column_family_directory(cfname, uuid);
+                dblog.info("Keyspace {}: Reading CF {} ", ks_name, cfname);
+                return ks.make_directory_for_column_family(cfname, uuid).then([cf, sstdir] {
+                    return cf->populate(sstdir);
+                }).handle_exception([ks_name, cfname, sstdir](std::exception_ptr eptr) {
+                    std::string msg =
+                        sprint("Exception while populating keyspace '%s' with column family '%s' from file '%s': %s",
+                               ks_name, cfname, sstdir, eptr);
+                    dblog.error("Exception while populating keyspace '{}' with column family '{}' from file '{}': {}",
+                                ks_name, cfname, sstdir, eptr);
+                    throw std::runtime_error(msg.c_str());
+                });
+            });
     }
-    return make_ready_future<>();
 }
 
 future<> database::populate(sstring datadir) {
@@ -1476,8 +1526,17 @@ void database::add_keyspace(sstring name, keyspace k) {
     _keyspaces.emplace(std::move(name), std::move(k));
 }
 
-void database::update_keyspace(const sstring& name) {
-    throw std::runtime_error("update keyspace not implemented");
+future<> database::update_keyspace(const sstring& name) {
+    auto& proxy = service::get_storage_proxy();
+    return db::schema_tables::read_schema_partition_for_keyspace(proxy, db::schema_tables::KEYSPACES, name).then([this, name](db::schema_tables::schema_result_value_type&& v) {
+        auto& ks = find_keyspace(name);
+
+        auto tmp_ksm = db::schema_tables::create_keyspace_from_schema_partition(v);
+        auto new_ksm = ::make_lw_shared<keyspace_metadata>(tmp_ksm->name(), tmp_ksm->strategy_name(), tmp_ksm->strategy_options(), tmp_ksm->durable_writes(),
+                        boost::copy_range<std::vector<schema_ptr>>(ks.metadata()->cf_meta_data() | boost::adaptors::map_values), ks.metadata()->user_types());
+        ks.update_from(std::move(new_ksm));
+        return service::get_local_migration_manager().notify_update_keyspace(ks.metadata());
+    });
 }
 
 void database::drop_keyspace(const sstring& name) {
@@ -1631,6 +1690,11 @@ keyspace::set_replication_strategy(std::unique_ptr<locator::abstract_replication
     _replication_strategy = std::move(replication_strategy);
 }
 
+void keyspace::update_from(::lw_shared_ptr<keyspace_metadata> ksm) {
+    _metadata = std::move(ksm);
+   create_replication_strategy(_metadata->strategy_options());
+}
+
 column_family::config
 keyspace::make_column_family_config(const schema& s) const {
     column_family::config cfg;
@@ -1658,7 +1722,11 @@ keyspace::column_family_directory(const sstring& name, utils::UUID uuid) const {
 
 future<>
 keyspace::make_directory_for_column_family(const sstring& name, utils::UUID uuid) {
-    return io_check(touch_directory, column_family_directory(name, uuid));
+    auto cfdir = column_family_directory(name, uuid);
+    return seastar::async([cfdir = std::move(cfdir)] {
+        io_check(touch_directory, cfdir).get();
+        io_check(touch_directory, cfdir + "/upload").get();
+    });
 }
 
 no_such_keyspace::no_such_keyspace(const sstring& ks_name)
@@ -1830,7 +1898,7 @@ column_family::query(schema_ptr s, const query::read_command& cmd, query::result
         }).finally([lc, this]() mutable {
         _stats.reads.mark(lc);
         if (lc.is_start()) {
-            _stats.estimated_read.add(lc.latency(), _stats.reads.count);
+            _stats.estimated_read.add(lc.latency(), _stats.reads.hist.count);
         }
         });
     }
@@ -1838,8 +1906,11 @@ column_family::query(schema_ptr s, const query::read_command& cmd, query::result
 
 mutation_source
 column_family::as_mutation_source() const {
-    return mutation_source([this] (schema_ptr s, const query::partition_range& range, const io_priority_class& pc) {
-        return this->make_reader(std::move(s), range, pc);
+    return mutation_source([this] (schema_ptr s,
+                                   const query::partition_range& range,
+                                   query::clustering_key_filtering_context ck_filtering,
+                                   const io_priority_class& pc) {
+        return this->make_reader(std::move(s), range, ck_filtering, pc);
     });
 }
 
@@ -1931,7 +2002,7 @@ column_family::apply(const mutation& m, const db::replay_position& rp) {
     _memtables->seal_on_overflow();
     _stats.writes.mark(lc);
     if (lc.is_start()) {
-        _stats.estimated_write.add(lc.latency(), _stats.writes.count);
+        _stats.estimated_write.add(lc.latency(), _stats.writes.hist.count);
     }
 }
 
@@ -1944,7 +2015,7 @@ column_family::apply(const frozen_mutation& m, const schema_ptr& m_schema, const
     _memtables->seal_on_overflow();
     _stats.writes.mark(lc);
     if (lc.is_start()) {
-        _stats.estimated_write.add(lc.latency(), _stats.writes.count);
+        _stats.estimated_write.add(lc.latency(), _stats.writes.hist.count);
     }
 }
 
@@ -2522,7 +2593,7 @@ future<> column_family::flush() {
     // FIXME: this will synchronously wait for this write to finish, but doesn't guarantee
     // anything about previous writes.
     _stats.pending_flushes++;
-    return seal_active_memtable().finally([this]() mutable {
+    return _memtables->seal_active_memtable().finally([this]() mutable {
         _stats.pending_flushes--;
         // In origin memtable_switch_count is incremented inside
         // ColumnFamilyMeetrics Flush.run
@@ -2544,7 +2615,7 @@ future<> column_family::flush(const db::replay_position& pos) {
     // We ignore this for now and just say that if we're asked for
     // a CF and it exists, we pretty much have to have data that needs
     // flushing. Let's do it.
-    return seal_active_memtable();
+    return _memtables->seal_active_memtable();
 }
 
 // FIXME: We can do much better than this in terms of cache management. Right
@@ -2561,7 +2632,7 @@ future<> column_family::flush_streaming_mutations(std::vector<query::partition_r
     // need this code to go away as soon as we can (see FIXME above). So the double gate is a better
     // temporary counter measure.
     return with_gate(_streaming_flush_gate, [this, ranges = std::move(ranges)] {
-        return seal_active_streaming_memtable_delayed().finally([this, ranges = std::move(ranges)] {
+        return _streaming_memtables->seal_active_memtable().finally([this, ranges = std::move(ranges)] {
             if (_config.enable_cache) {
                 for (auto& range : ranges) {
                     _cache.invalidate(range);
@@ -2583,7 +2654,6 @@ void column_family::clear() {
 // if we implement notifications, whatnot.
 future<db::replay_position> column_family::discard_sstables(db_clock::time_point truncated_at) {
     assert(_compaction_disabled > 0);
-    assert(!compaction_manager_queued());
 
     return with_lock(_sstables_lock.for_read(), [this, truncated_at] {
         db::replay_position rp;

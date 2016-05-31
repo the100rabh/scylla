@@ -118,7 +118,7 @@ public:
             : _p(std::make_unique<rpc_protocol::client>(proto, std::move(opts), addr, local)) {
     }
     rpc_protocol_client_wrapper(rpc_protocol& proto, rpc::client_options opts, ipv4_addr addr, ipv4_addr local, ::shared_ptr<seastar::tls::server_credentials> c)
-            : _p(std::make_unique<rpc_protocol::client>(proto, std::move(opts), addr, seastar::tls::connect(c, addr, local)))
+            : _p(std::make_unique<rpc_protocol::client>(proto, std::move(opts), seastar::tls::socket(c), addr, local))
     {}
     auto get_stats() const { return _p->get_stats(); }
     future<> stop() { return _p->stop(); }
@@ -225,7 +225,7 @@ messaging_service::messaging_service(gms::inet_address ip
         , uint16_t port
         , encrypt_what ew
         , uint16_t ssl_port
-        , ::shared_ptr<seastar::tls::server_credentials> credentials
+        , std::shared_ptr<seastar::tls::credentials_builder> credentials
         )
     : _listen_address(ip)
     , _port(port)
@@ -233,7 +233,7 @@ messaging_service::messaging_service(gms::inet_address ip
     , _encrypt_what(ew)
     , _rpc(new rpc_protocol_wrapper(serializer { }))
     , _server(new rpc_protocol_server_wrapper(*_rpc, ipv4_addr { _listen_address.raw_addr(), _port }, rpc_resource_limits()))
-    , _credentials(std::move(credentials))
+    , _credentials(credentials ? credentials->build_server_credentials() : nullptr)
     , _server_tls([this]() -> std::unique_ptr<rpc_protocol_server_wrapper>{
         if (_encrypt_what == encrypt_what::none) {
             return nullptr;
@@ -255,6 +255,13 @@ messaging_service::messaging_service(gms::inet_address ip
         ci.attach_auxiliary("src_cpu_id", src_cpu_id);
         return rpc::no_wait;
     });
+    // Do this on just cpu 0, to avoid duplicate logs.
+    if (engine().cpu_id() == 0) {
+        if (_server_tls) {
+            logger.info("Starting Encrypted Messaging Service on SSL port {}", _ssl_port);
+        }
+        logger.info("Starting Messaging Service on port {}", _port);
+    }
 }
 
 msg_addr messaging_service::get_source(const rpc::client_info& cinfo) {
@@ -543,8 +550,11 @@ auto send_message_timeout_and_retry(messaging_service* ms, messaging_verb verb, 
                                      vb, id, retry);
                         throw;
                     }
-                    return sleep(wait).then([] {
+                    return sleep_abortable(wait).then([] {
                         return make_ready_future<stdx::optional<MsgInTuple>>(stdx::nullopt);
+                    }).handle_exception([vb, id, retry] (std::exception_ptr ep) {
+                        logger.debug("Retry verb={} to {}, retry={}: stop retrying: {}", vb, id, retry, ep);
+                        return make_exception_future<stdx::optional<MsgInTuple>>(ep);
                     });
                 } catch (...) {
                     throw;
@@ -766,14 +776,14 @@ future<reconcilable_result> messaging_service::send_read_mutation_data(msg_addr 
     return send_message_timeout<reconcilable_result>(this, messaging_verb::READ_MUTATION_DATA, std::move(id), timeout, cmd, pr);
 }
 
-void messaging_service::register_read_digest(std::function<future<query::result_digest> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
+void messaging_service::register_read_digest(std::function<future<query::result_digest, api::timestamp_type> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
     register_handler(this, net::messaging_verb::READ_DIGEST, std::move(func));
 }
 void messaging_service::unregister_read_digest() {
     _rpc->unregister_handler(net::messaging_verb::READ_DIGEST);
 }
-future<query::result_digest> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
-    return send_message_timeout<query::result_digest>(this, net::messaging_verb::READ_DIGEST, std::move(id), timeout, cmd, pr);
+future<query::result_digest, rpc::optional<api::timestamp_type>> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
+    return send_message_timeout<future<query::result_digest, rpc::optional<api::timestamp_type>>>(this, net::messaging_verb::READ_DIGEST, std::move(id), timeout, cmd, pr);
 }
 
 // Wrapper for TRUNCATE

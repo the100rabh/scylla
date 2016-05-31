@@ -32,6 +32,9 @@ options {
 
 @parser::includes {
 #include "cql3/selection/writetime_or_ttl.hh"
+#include "cql3/statements/raw/parsed_statement.hh"
+#include "cql3/statements/raw/select_statement.hh"
+#include "cql3/statements/alter_keyspace_statement.hh"
 #include "cql3/statements/alter_table_statement.hh"
 #include "cql3/statements/create_keyspace_statement.hh"
 #include "cql3/statements/drop_keyspace_statement.hh"
@@ -43,7 +46,6 @@ options {
 #include "cql3/statements/property_definitions.hh"
 #include "cql3/statements/drop_table_statement.hh"
 #include "cql3/statements/truncate_statement.hh"
-#include "cql3/statements/select_statement.hh"
 #include "cql3/statements/update_statement.hh"
 #include "cql3/statements/delete_statement.hh"
 #include "cql3/statements/index_prop_defs.hh"
@@ -294,11 +296,11 @@ struct uninitialized {
 
 /** STATEMENTS **/
 
-query returns [shared_ptr<parsed_statement> stmnt]
+query returns [shared_ptr<raw::parsed_statement> stmnt]
     : st=cqlStatement (';')* EOF { $stmnt = st; }
     ;
 
-cqlStatement returns [shared_ptr<parsed_statement> stmt]
+cqlStatement returns [shared_ptr<raw::parsed_statement> stmt]
     @after{ if (stmt) { stmt->set_bound_variables(_bind_variables); } }
     : st1= selectStatement             { $stmt = st1; }
     | st2= insertStatement             { $stmt = st2; }
@@ -316,9 +318,7 @@ cqlStatement returns [shared_ptr<parsed_statement> stmt]
     | st13=dropIndexStatement          { $stmt = st13; }
 #endif
     | st14=alterTableStatement         { $stmt = st14; }
-#if 0
     | st15=alterKeyspaceStatement      { $stmt = st15; }
-#endif
     | st16=grantStatement              { $stmt = st16; }
     | st17=revokeStatement             { $stmt = st17; }
     | st18=listPermissionsStatement    { $stmt = st18; }
@@ -354,11 +354,11 @@ useStatement returns [::shared_ptr<use_statement> stmt]
  * WHERE KEY = "key1" AND COL > 1 AND COL < 100
  * LIMIT <NUMBER>;
  */
-selectStatement returns [shared_ptr<select_statement::raw_statement> expr]
+selectStatement returns [shared_ptr<raw::select_statement> expr]
     @init {
         bool is_distinct = false;
         ::shared_ptr<cql3::term::raw> limit;
-        select_statement::parameters::orderings_type orderings;
+        raw::select_statement::parameters::orderings_type orderings;
         bool allow_filtering = false;
     }
     : K_SELECT ( ( K_DISTINCT { is_distinct = true; } )?
@@ -371,8 +371,8 @@ selectStatement returns [shared_ptr<select_statement::raw_statement> expr]
       ( K_LIMIT rows=intValue { limit = rows; } )?
       ( K_ALLOW K_FILTERING  { allow_filtering = true; } )?
       {
-          auto params = ::make_shared<select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering);
-          $expr = ::make_shared<select_statement::raw_statement>(std::move(cf), std::move(params),
+          auto params = ::make_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering);
+          $expr = ::make_shared<raw::select_statement>(std::move(cf), std::move(params),
             std::move(sclause), std::move(wclause), std::move(limit));
       }
     ;
@@ -426,7 +426,7 @@ whereClause returns [std::vector<cql3::relation_ptr> clause]
     : relation[$clause] (K_AND relation[$clause])*
     ;
 
-orderByClause[select_statement::parameters::orderings_type& orderings]
+orderByClause[raw::select_statement::parameters::orderings_type& orderings]
     @init{
         bool reversed = false;
     }
@@ -809,15 +809,18 @@ dropTriggerStatement returns [DropTriggerStatement expr]
       { $expr = new DropTriggerStatement(cf, name.toString(), ifExists); }
     ;
 
+#endif
+
 /**
  * ALTER KEYSPACE <KS> WITH <property> = <value>;
  */
-alterKeyspaceStatement returns [AlterKeyspaceStatement expr]
-    @init { KSPropDefs attrs = new KSPropDefs(); }
+alterKeyspaceStatement returns [shared_ptr<cql3::statements::alter_keyspace_statement> expr]
+    @init {
+        auto attrs = make_shared<cql3::statements::ks_prop_defs>();
+    }
     : K_ALTER K_KEYSPACE ks=keyspaceName
-        K_WITH properties[attrs] { $expr = new AlterKeyspaceStatement(ks, attrs); }
+        K_WITH properties[attrs] { $expr = make_shared<cql3::statements::alter_keyspace_statement>(ks, attrs); }
     ;
-#endif
 
 /**
  * ALTER COLUMN FAMILY <CF> ALTER <column> TYPE <newtype>;

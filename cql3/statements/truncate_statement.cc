@@ -40,6 +40,7 @@
  */
 
 #include "cql3/statements/truncate_statement.hh"
+#include "cql3/statements/prepared_statement.hh"
 #include "cql3/cql_statement.hh"
 
 #include <experimental/optional>
@@ -58,9 +59,9 @@ uint32_t truncate_statement::get_bound_terms()
     return 0;
 }
 
-::shared_ptr<parsed_statement::prepared> truncate_statement::prepare(database& db)
+::shared_ptr<prepared_statement> truncate_statement::prepare(database& db)
 {
-    return ::make_shared<parsed_statement::prepared>(this->shared_from_this());
+    return ::make_shared<prepared>(this->shared_from_this());
 }
 
 bool truncate_statement::uses_function(const sstring& ks_name, const sstring& function_name) const

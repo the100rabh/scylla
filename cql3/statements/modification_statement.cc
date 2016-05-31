@@ -40,6 +40,7 @@
  */
 
 #include "cql3/statements/modification_statement.hh"
+#include "cql3/statements/prepared_statement.hh"
 #include "cql3/restrictions/single_column_restriction.hh"
 #include "cql3/single_column_relation.hh"
 #include "validation.hh"
@@ -560,11 +561,11 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
     }
 }
 
-::shared_ptr<parsed_statement::prepared>
+::shared_ptr<prepared_statement>
 modification_statement::parsed::prepare(database& db) {
     auto bound_names = get_bound_variables();
     auto statement = prepare(db, bound_names);
-    return ::make_shared<parsed_statement::prepared>(std::move(statement), *bound_names);
+    return ::make_shared<prepared>(std::move(statement), *bound_names);
 }
 
 ::shared_ptr<modification_statement>

@@ -396,6 +396,21 @@ public void notifyDropAggregate(UDAggregate udf)
 }
 #endif
 
+future<> migration_manager::announce_keyspace_update(lw_shared_ptr<keyspace_metadata> ksm, bool announce_locally) {
+    return announce_keyspace_update(ksm, api::new_timestamp(), announce_locally);
+}
+
+future<> migration_manager::announce_keyspace_update(lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp, bool announce_locally) {
+    ksm->validate();
+    auto& proxy = get_local_storage_proxy();
+    if (!proxy.get_db().local().has_keyspace(ksm->name())) {
+        throw exceptions::configuration_exception(sprint("Cannot update non existing keyspace '%s'.", ksm->name()));
+    }
+    logger.info("Update Keyspace: {}", ksm);
+    auto mutations = db::schema_tables::make_create_keyspace_mutations(ksm, timestamp);
+    return announce(std::move(mutations), announce_locally);
+}
+
 future<>migration_manager::announce_new_keyspace(lw_shared_ptr<keyspace_metadata> ksm, bool announce_locally)
 {
     return announce_new_keyspace(ksm, api::new_timestamp(), announce_locally);
@@ -710,20 +725,28 @@ public static class MigrationsSerializer implements IVersionedSerializer<Collect
 //
 // The endpoint is the node from which 's' originated.
 //
-// FIXME: Avoid the sync if the source was/is synced by schema_tables::merge_schema().
 static future<> maybe_sync(const schema_ptr& s, net::messaging_service::msg_addr endpoint) {
     if (s->is_synced()) {
         return make_ready_future<>();
     }
 
-    // Serialize schema sync by always doing it on shard 0.
-    return smp::submit_to(0, [gs = global_schema_ptr(s), endpoint] {
-        schema_ptr s = gs.get();
-        schema_registry_entry& e = *s->registry_entry();
-        return e.maybe_sync([endpoint, s] {
+    return s->registry_entry()->maybe_sync([s, endpoint] {
+        auto merge = [gs = global_schema_ptr(s), endpoint] {
+            schema_ptr s = gs.get();
             logger.debug("Syncing schema of {}.{} (v={}) with {}", s->ks_name(), s->cf_name(), s->version(), endpoint);
             return get_local_migration_manager().merge_schema_from(endpoint);
-        });
+        };
+
+        // Serialize schema sync by always doing it on shard 0.
+        if (engine().cpu_id() == 0) {
+            return merge();
+        } else {
+            return smp::submit_to(0, [gs = global_schema_ptr(s), endpoint, merge] {
+                schema_ptr s = gs.get();
+                schema_registry_entry& e = *s->registry_entry();
+                return e.maybe_sync(merge);
+            });
+        }
     });
 }
 

@@ -124,6 +124,7 @@ public:
         Filter,
         Statistics,
         TemporaryTOC,
+        TemporaryStatistics,
     };
     enum class version_types { ka, la };
     enum class format_types { big };
@@ -193,8 +194,11 @@ public:
         return _generation;
     }
 
-    future<mutation_opt> read_row(schema_ptr schema, const key& k,
-                                  const io_priority_class& pc = default_priority_class());
+    future<mutation_opt> read_row(
+        schema_ptr schema,
+        const key& k,
+        query::clustering_key_filtering_context ck_filtering = query::no_clustering_key_filtering,
+        const io_priority_class& pc = default_priority_class());
     /**
      * @param schema a schema_ptr object describing this table
      * @param min the minimum token we want to search for (inclusive)
@@ -207,8 +211,11 @@ public:
             const io_priority_class& pc = default_priority_class());
 
     // Returns a mutation_reader for given range of partitions
-    mutation_reader read_range_rows(schema_ptr schema, const query::partition_range& range,
-                                    const io_priority_class& pc = default_priority_class());
+    mutation_reader read_range_rows(
+        schema_ptr schema,
+        const query::partition_range& range,
+        query::clustering_key_filtering_context ck_filtering = query::no_clustering_key_filtering,
+        const io_priority_class& pc = default_priority_class());
 
     // read_rows() returns each of the rows in the sstable, in sequence,
     // converted to a "mutation" data structure.
@@ -409,6 +416,9 @@ private:
 
     future<> read_statistics(const io_priority_class& pc);
     void write_statistics(const io_priority_class& pc);
+    // Rewrite statistics component by creating a temporary Statistics and
+    // renaming it into place of existing one.
+    void rewrite_statistics(const io_priority_class& pc);
 
     future<> create_data();
 
@@ -529,6 +539,9 @@ public:
         return get_stats_metadata().sstable_level;
     }
 
+    // This will change sstable level only in memory.
+    void set_sstable_level(uint32_t);
+
     double get_compression_ratio() const;
 
     future<> mutate_sstable_level(uint32_t);
@@ -605,12 +618,29 @@ struct sstable_to_delete {
 // shared among shard, so actual on-disk deletion of an sstable is deferred
 // until all shards agree it can be deleted.
 //
+// When shutting down, we will not be able to complete some deletions.
+// In that case, an atomic_deletion_cancelled exception is returned instead.
+//
 // This function only solves the second problem for now.
 future<> delete_atomically(std::vector<shared_sstable> ssts);
 future<> delete_atomically(std::vector<sstable_to_delete> ssts);
 
+class atomic_deletion_cancelled : public std::exception {
+    std::string _msg;
+public:
+    explicit atomic_deletion_cancelled(std::vector<sstring> names);
+    template <typename StringRange>
+    explicit atomic_deletion_cancelled(StringRange range)
+            : atomic_deletion_cancelled(std::vector<sstring>{range.begin(), range.end()}) {
+    }
+    const char* what() const noexcept override;
+};
+
 // Cancel any deletions scheduled by delete_atomically() and make their
-// futures complete
+// futures complete (with an atomic_deletion_cancelled exception).
 void cancel_atomic_deletions();
+
+// Read toc content and delete all components found in it.
+future<> remove_by_toc_name(sstring sstable_toc_name);
 
 }
